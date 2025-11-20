@@ -27,8 +27,8 @@ if 'json_txt' not in st.session_state:
 def get_stock_data(tickers):
     try:
         # 下載包含 Open, High, Low, Close, Volume 的完整數據
-        # group_by='ticker' 可以確保格式統一，雖非必須但較保險
-        df = yf.download(tickers, period="1y", progress=False, auto_adjust=True)
+        # group_by='ticker' 確保多檔股票格式統一
+        df = yf.download(tickers, period="1y", progress=False, auto_adjust=True, group_by='ticker')
         return df
     except Exception as e:
         st.error(f"數據下載失敗: {e}")
@@ -54,7 +54,8 @@ def calculate_kd(close, high, low, n=9):
         return 50, 50, 50, 50
 
 def get_finmind_data(stock_id):
-    clean_id = stock_id.replace('.TW', '')
+    # FinMind 不需要 .TW 或 .TWO，只需要純數字代號
+    clean_id = stock_id.replace('.TW', '').replace('.TWO', '')
     fm = DataLoader()
     
     # 1. 籌碼
@@ -122,40 +123,66 @@ st.markdown("結合 **技術面 (KD/均線)** + **籌碼面 (外資/投信)** + 
 
 with st.sidebar:
     st.header("設定")
-    default_stocks = "2330, 6873, 6869"
+    # 預設值加入一些上櫃股票測試
+    default_stocks = "2330, 6873, 6488"
     user_input = st.text_area("輸入股票代號 (用逗號分隔)", default_stocks, height=100)
     
-    # 按鈕邏輯：計算 -> 存 Session
     if st.button("🚀 開始分析", type="primary"):
-        stock_list = [s.strip().upper() for s in user_input.split(',') if s.strip()]
-        stock_list_tw = [s if '.TW' in s else f'{s}.TW' for s in stock_list]
+        # 1. 整理使用者輸入的代號
+        raw_symbols = [s.strip().upper() for s in user_input.split(',') if s.strip()]
         
-        with st.spinner(f"正在分析 {len(stock_list_tw)} 檔股票..."):
-            df_all = get_stock_data(stock_list_tw)
+        # 2. 【關鍵修正】為每個代號同時產生 .TW (上市) 和 .TWO (上櫃) 兩種可能
+        search_list = []
+        for s in raw_symbols:
+            # 如果使用者自己沒打 .TW 或 .TWO，我們就幫他兩個都猜
+            if '.TW' not in s and '.TWO' not in s:
+                search_list.append(f'{s}.TW')
+                search_list.append(f'{s}.TWO')
+            else:
+                search_list.append(s) # 使用者自己有打後綴就照用
+        
+        with st.spinner(f"正在掃描 {len(raw_symbols)} 檔股票 (嘗試上市/上櫃匹配)..."):
+            # 3. 一次性下載所有可能的代號
+            df_all = get_stock_data(search_list)
             
             processed_data = [] 
             all_ai_data_list = []
             pdf = ReportPDF()
             pdf.set_auto_page_break(auto=True, margin=15)
             
-            for stock in stock_list_tw:
-                clean_stock = stock.replace('.TW', '')
+            # 4. 逐一檢查哪個代號才是真的
+            for stock_code in raw_symbols:
+                valid_ticker = None
+                stock_df = None
+                
+                # 嘗試找 .TW
+                try:
+                    if f"{stock_code}.TW" in df_all.columns.levels[0]: # 檢查第一層索引(Ticker)
+                        temp_df = df_all[f"{stock_code}.TW"]
+                        # 檢查是不是全是空值 (有些下市股會有欄位但沒數據)
+                        if not temp_df.isnull().all().all():
+                            valid_ticker = f"{stock_code}.TW"
+                            stock_df = temp_df
+                except: pass
+                
+                # 如果 .TW 沒資料，嘗試找 .TWO
+                if valid_ticker is None:
+                    try:
+                        if f"{stock_code}.TWO" in df_all.columns.levels[0]:
+                            temp_df = df_all[f"{stock_code}.TWO"]
+                            if not temp_df.isnull().all().all():
+                                valid_ticker = f"{stock_code}.TWO"
+                                stock_df = temp_df
+                    except: pass
+
+                # 如果兩個都找不到，那就真的是無效代號
+                if valid_ticker is None or stock_df is None:
+                    st.warning(f"⚠️ 找不到 {stock_code} 的數據 (可能代號錯誤或已下市)")
+                    continue
+
+                # --- 接下來的邏輯與之前相同，使用 valid_ticker 繼續處理 ---
                 
                 try:
-                    # --- 關鍵修正：統一資料讀取格式 (防呆機制) ---
-                    # 判斷是否為 MultiIndex (多層索引，通常多檔股票時會出現)
-                    if isinstance(df_all.columns, pd.MultiIndex):
-                        # 嘗試提取該股票的數據
-                        try:
-                            stock_df = df_all.xs(stock, axis=1, level=1)
-                        except KeyError:
-                            # 如果抓不到，可能是下市或代號錯誤
-                            continue
-                    else:
-                        # 單層索引 (通常單檔股票時會出現)
-                        stock_df = df_all
-                    
-                    # 確保我們拿到的是 DataFrame
                     ohlc_data = pd.DataFrame({
                         'Open': stock_df['Open'],
                         'High': stock_df['High'],
@@ -163,67 +190,63 @@ with st.sidebar:
                         'Close': stock_df['Close'],
                         'Volume': stock_df['Volume']
                     })
-                    
-                    # 清洗數據
                     ohlc_data.dropna(inplace=True)
                     if ohlc_data.empty: continue
 
+                    clean_close = ohlc_data['Close'] 
+                    price_now = float(clean_close.iloc[-1])
+                    ma5 = float(clean_close.rolling(5).mean().iloc[-1])
+                    ma20 = float(clean_close.rolling(20).mean().iloc[-1])
+                    bias_20 = ((price_now - ma20) / ma20) * 100
+                    k, d, k_prev, d_prev = calculate_kd(clean_close, ohlc_data['High'], ohlc_data['Low'])
+                    
+                    # 這裡傳入原始數字代號給 FinMind 即可
+                    f_buy, t_buy, yoy, yoy_str, rev_amt = get_finmind_data(stock_code)
+
+                    processed_data.append({
+                        "stock": valid_ticker, # 顯示正確的 .TW 或 .TWO
+                        "price_now": price_now, "bias_20": bias_20,
+                        "k": k, "d": d, "f_buy": f_buy, "t_buy": t_buy, "yoy_str": yoy_str,
+                        "data_close": clean_close 
+                    })
+
+                    # PDF
+                    pdf.add_page()
+                    pdf.set_font("Arial", 'B', 16)
+                    pdf.cell(0, 10, f"Stock Symbol: {valid_ticker}", 0, 1)
+                    pdf.set_font("Arial", '', 12)
+                    pdf.cell(0, 8, f"Price: {price_now:.2f} | Bias(20MA): {bias_20:.2f}%", 0, 1)
+                    pdf.cell(0, 8, f"KD: K={k:.1f}, D={d:.1f}", 0, 1)
+                    pdf.cell(0, 8, f"Chips(5d): Foreign {int(f_buy)}, Trust {int(t_buy)}", 0, 1)
+                    pdf.cell(0, 8, f"Revenue YoY: {yoy_str.replace('No Base', 'N/A')}", 0, 1)
+                    
+                    mc = mpf.make_marketcolors(up='r', down='g', inherit=True)
+                    s  = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc)
+                    subset_ohlc = ohlc_data.tail(120)
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile:
+                        mpf.plot(subset_ohlc, type='candle', mav=(5, 20), volume=True, style=s, 
+                                 title=f"\n{valid_ticker} Daily Chart (Last 6 Months)", 
+                                 savefig=dict(fname=tmpfile.name, dpi=100, pad_inches=0.25))
+                        tmp_filename = tmpfile.name
+                    pdf.image(tmp_filename, x=10, y=60, w=190)
+                    os.unlink(tmp_filename)
+                    pdf.ln(120) 
+
+                    # AI Data
+                    ai_data = {
+                        "symbol": valid_ticker,
+                        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                        "price_data": {"current": round(price_now, 2), "bias_20_pct": round(bias_20, 2)},
+                        "chips_data": {"foreign_net_buy_5d": float(f_buy), "trust_net_buy_5d": float(t_buy)},
+                        "fundamentals": {"monthly_revenue_yoy_pct": round(yoy, 2) if yoy is not None else None},
+                        "indicators": {"k_value": round(k, 2), "d_value": round(d, 2)}
+                    }
+                    all_ai_data_list.append(ai_data)
+
                 except Exception as e:
-                    # 遇到奇怪的資料格式就跳過，避免整個程式崩潰
+                    st.error(f"處理 {valid_ticker} 時發生錯誤: {e}")
                     continue
-
-                # 計算指標 (使用清洗後的數據)
-                clean_close = ohlc_data['Close'] 
-                
-                price_now = float(clean_close.iloc[-1])
-                ma5 = float(clean_close.rolling(5).mean().iloc[-1])
-                ma20 = float(clean_close.rolling(20).mean().iloc[-1])
-                bias_20 = ((price_now - ma20) / ma20) * 100
-                k, d, k_prev, d_prev = calculate_kd(clean_close, ohlc_data['High'], ohlc_data['Low'])
-                f_buy, t_buy, yoy, yoy_str, rev_amt = get_finmind_data(stock)
-
-                # 儲存到 Session
-                processed_data.append({
-                    "stock": stock,
-                    "price_now": price_now, "bias_20": bias_20,
-                    "k": k, "d": d, "f_buy": f_buy, "t_buy": t_buy, "yoy_str": yoy_str,
-                    "data_close": clean_close 
-                })
-
-                # --- PDF 生成 ---
-                pdf.add_page()
-                pdf.set_font("Arial", 'B', 16)
-                pdf.cell(0, 10, f"Stock Symbol: {stock}", 0, 1)
-                pdf.set_font("Arial", '', 12)
-                pdf.cell(0, 8, f"Price: {price_now:.2f} | Bias(20MA): {bias_20:.2f}%", 0, 1)
-                pdf.cell(0, 8, f"KD: K={k:.1f}, D={d:.1f}", 0, 1)
-                pdf.cell(0, 8, f"Chips(5d): Foreign {int(f_buy)}, Trust {int(t_buy)}", 0, 1)
-                pdf.cell(0, 8, f"Revenue YoY: {yoy_str.replace('No Base', 'N/A')}", 0, 1)
-                
-                mc = mpf.make_marketcolors(up='r', down='g', inherit=True)
-                s  = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc)
-                subset_ohlc = ohlc_data.tail(120)
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile:
-                    mpf.plot(subset_ohlc, type='candle', mav=(5, 20), volume=True, style=s, 
-                             title=f"\n{stock} Daily Chart (Last 6 Months)", 
-                             savefig=dict(fname=tmpfile.name, dpi=100, pad_inches=0.25))
-                    tmp_filename = tmpfile.name
-
-                pdf.image(tmp_filename, x=10, y=60, w=190)
-                os.unlink(tmp_filename)
-                pdf.ln(120) 
-
-                # --- AI 數據包 ---
-                ai_data = {
-                    "symbol": stock,
-                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M'),
-                    "price_data": {"current": round(price_now, 2), "bias_20_pct": round(bias_20, 2)},
-                    "chips_data": {"foreign_net_buy_5d": float(f_buy), "trust_net_buy_5d": float(t_buy)},
-                    "fundamentals": {"monthly_revenue_yoy_pct": round(yoy, 2) if yoy is not None else None},
-                    "indicators": {"k_value": round(k, 2), "d_value": round(d, 2)}
-                }
-                all_ai_data_list.append(ai_data)
             
             st.session_state['analyzed_data'] = processed_data
             st.session_state['json_txt'] = json.dumps(all_ai_data_list, indent=4, ensure_ascii=False)
@@ -232,11 +255,10 @@ with st.sidebar:
             except:
                 st.session_state['pdf_bytes'] = None
 
-    st.info("提示：輸入代號即可，系統會自動加上 .TW")
+    st.info("提示：輸入代號即可，系統會自動判斷上市或上櫃")
 
 # --- 顯示邏輯 ---
 if st.session_state['analyzed_data']:
-    
     col_d1, col_d2 = st.columns(2)
     if st.session_state['json_txt']:
         with col_d1:
@@ -261,10 +283,4 @@ if st.session_state['analyzed_data']:
     for item in st.session_state['analyzed_data']:
         st.subheader(f"🔷 {item['stock']}")
         col1, col2, col3, col4 = st.columns(4)
-        with col1: st.metric("最新股價", f"{item['price_now']:.2f}", f"{item['bias_20']:.2f}% (乖離)")
-        with col2: st.metric("KD 指標", f"K{item['k']:.1f} / D{item['d']:.1f}")
-        with col3: st.metric("法人籌碼 (5日)", f"外{int(item['f_buy'])} / 投{int(item['t_buy'])}")
-        with col4: st.metric("月營收 YoY", item['yoy_str'])
-        
-        st.line_chart(item['data_close'].tail(100))
-        st.markdown("---")
+        with col1: st.metric("最新股價", f"{item['
