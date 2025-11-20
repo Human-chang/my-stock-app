@@ -1,0 +1,263 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from FinMind.data import DataLoader
+from datetime import datetime, timedelta
+import json
+import io
+from fpdf import FPDF
+import tempfile
+import os
+import mplfinance as mpf
+
+# --- 設定頁面資訊 ---
+st.set_page_config(page_title="Gemini 股市戰情室", page_icon="📈", layout="wide")
+
+# --- 初始化 Session State (記憶體) ---
+if 'analyzed_data' not in st.session_state:
+    st.session_state['analyzed_data'] = None
+if 'pdf_bytes' not in st.session_state:
+    st.session_state['pdf_bytes'] = None
+if 'json_txt' not in st.session_state:
+    st.session_state['json_txt'] = None
+
+# --- 核心邏輯函數 ---
+@st.cache_data(ttl=3600)
+def get_stock_data(tickers):
+    try:
+        df = yf.download(tickers, period="1y", progress=False, auto_adjust=True)
+        return df
+    except Exception as e:
+        st.error(f"數據下載失敗: {e}")
+        return pd.DataFrame()
+
+def calculate_kd(close, high, low, n=9):
+    try:
+        close = pd.Series(close)
+        high = pd.Series(high)
+        low = pd.Series(low)
+        low_min = low.rolling(window=n).min()
+        high_max = high.rolling(window=n).max()
+        rsv = (close - low_min) / (high_max - low_min) * 100
+        rsv = rsv.fillna(50)
+        k_values, d_values = [50], [50]
+        for i in range(1, len(rsv)):
+            k = (2/3) * k_values[-1] + (1/3) * rsv.iloc[i]
+            d = (2/3) * d_values[-1] + (1/3) * k
+            k_values.append(k)
+            d_values.append(d)
+        return k_values[-1], d_values[-1], k_values[-2], d_values[-2]
+    except:
+        return 50, 50, 50, 50
+
+def get_finmind_data(stock_id):
+    clean_id = stock_id.replace('.TW', '')
+    fm = DataLoader()
+    
+    # 1. 籌碼
+    df_chips = fm.taiwan_stock_institutional_investors(
+        stock_id=clean_id,
+        start_date=(datetime.now() - timedelta(days=40)).strftime('%Y-%m-%d'),
+        end_date=datetime.now().strftime('%Y-%m-%d')
+    )
+    
+    foreign_buy, trust_buy = 0, 0
+    if not df_chips.empty:
+        f_data = df_chips[df_chips['name'] == 'Foreign_Investor']
+        t_data = df_chips[df_chips['name'] == 'Investment_Trust']
+        if not f_data.empty:
+            foreign_buy = ((f_data['buy'] - f_data['sell']) / 1000).tail(5).sum()
+        if not t_data.empty:
+            trust_buy = ((t_data['buy'] - t_data['sell']) / 1000).tail(5).sum()
+
+    # 2. 營收
+    df_rev = fm.taiwan_stock_month_revenue(
+        stock_id=clean_id,
+        start_date=(datetime.now() - timedelta(days=450)).strftime('%Y-%m-%d'),
+        end_date=datetime.now().strftime('%Y-%m-%d')
+    )
+    
+    rev_yoy = None
+    current_rev = 0
+    rev_msg = "N/A"
+    
+    if not df_rev.empty:
+        df_rev['revenue'] = pd.to_numeric(df_rev['revenue'], errors='coerce')
+        latest = df_rev.iloc[-1]
+        current_rev = latest['revenue']
+        this_year, this_month = int(latest['revenue_year']), int(latest['revenue_month'])
+        
+        prev = df_rev[(df_rev['revenue_year'] == this_year - 1) & (df_rev['revenue_month'] == this_month)]
+        if not prev.empty:
+            last_rev = prev.iloc[0]['revenue']
+            if last_rev > 0:
+                rev_yoy = ((current_rev - last_rev) / last_rev) * 100
+                rev_msg = f"{rev_yoy:.2f}%"
+            else:
+                rev_msg = "No Base"
+        else:
+            rev_msg = "No Data"
+
+    return foreign_buy, trust_buy, rev_yoy, rev_msg, current_rev
+
+# --- PDF 生成類別 ---
+class ReportPDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 15)
+        self.cell(0, 10, 'Gemini Stock Analysis Report', 0, 1, 'C')
+        self.ln(10)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+
+# --- UI 介面設計 ---
+
+st.title("📊 Gemini 投資戰情室")
+st.markdown("結合 **技術面 (KD/均線)** + **籌碼面 (外資/投信)** + **基本面 (營收YoY)** 的三合一分析工具")
+
+with st.sidebar:
+    st.header("設定")
+    default_stocks = "2330, 6873, 6869"
+    user_input = st.text_area("輸入股票代號 (用逗號分隔)", default_stocks, height=100)
+    
+    # 按鈕邏輯：計算 -> 存 Session
+    if st.button("🚀 開始分析", type="primary"):
+        stock_list = [s.strip().upper() for s in user_input.split(',') if s.strip()]
+        stock_list_tw = [s if '.TW' in s else f'{s}.TW' for s in stock_list]
+        
+        with st.spinner(f"正在分析 {len(stock_list_tw)} 檔股票..."):
+            df_all = get_stock_data(stock_list_tw)
+            
+            processed_data = [] 
+            all_ai_data_list = []
+            pdf = ReportPDF()
+            pdf.set_auto_page_break(auto=True, margin=15)
+            
+            for stock in stock_list_tw:
+                clean_stock = stock.replace('.TW', '')
+                
+                try:
+                    if len(stock_list_tw) > 1:
+                        data_close = df_all['Close'][stock]
+                        data_high = df_all['High'][stock]
+                        data_low = df_all['Low'][stock]
+                        data_open = df_all['Open'][stock]
+                        data_volume = df_all['Volume'][stock]
+                    else:
+                        data_close = df_all['Close']
+                        data_high = df_all['High']
+                        data_low = df_all['Low']
+                        data_open = df_all['Open']
+                        data_volume = df_all['Volume']
+
+                    ohlc_data = pd.DataFrame({
+                        'Open': data_open, 'High': data_high, 'Low': data_low,
+                        'Close': data_close, 'Volume': data_volume
+                    })
+                    # 關鍵修正：這裡清洗了數據 (移除空值)
+                    ohlc_data.dropna(inplace=True)
+                    
+                    if ohlc_data.empty: continue
+
+                except KeyError: continue
+
+                # 計算指標 (使用清洗後的數據)
+                clean_close = ohlc_data['Close'] # 確保使用乾淨的 Series
+                
+                price_now = float(clean_close.iloc[-1])
+                ma5 = float(clean_close.rolling(5).mean().iloc[-1])
+                ma20 = float(clean_close.rolling(20).mean().iloc[-1])
+                bias_20 = ((price_now - ma20) / ma20) * 100
+                k, d, k_prev, d_prev = calculate_kd(clean_close, ohlc_data['High'], ohlc_data['Low'])
+                f_buy, t_buy, yoy, yoy_str, rev_amt = get_finmind_data(stock)
+
+                # 儲存到 Session (關鍵：這裡改存 clean_close，確保 Web 圖表有數據)
+                processed_data.append({
+                    "stock": stock,
+                    "price_now": price_now, "bias_20": bias_20,
+                    "k": k, "d": d, "f_buy": f_buy, "t_buy": t_buy, "yoy_str": yoy_str,
+                    "data_close": clean_close  # <--- 修正點：存入乾淨的數據
+                })
+
+                # --- PDF 生成 ---
+                pdf.add_page()
+                pdf.set_font("Arial", 'B', 16)
+                pdf.cell(0, 10, f"Stock Symbol: {stock}", 0, 1)
+                pdf.set_font("Arial", '', 12)
+                pdf.cell(0, 8, f"Price: {price_now:.2f} | Bias(20MA): {bias_20:.2f}%", 0, 1)
+                pdf.cell(0, 8, f"KD: K={k:.1f}, D={d:.1f}", 0, 1)
+                pdf.cell(0, 8, f"Chips(5d): Foreign {int(f_buy)}, Trust {int(t_buy)}", 0, 1)
+                pdf.cell(0, 8, f"Revenue YoY: {yoy_str.replace('No Base', 'N/A')}", 0, 1)
+                
+                mc = mpf.make_marketcolors(up='r', down='g', inherit=True)
+                s  = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc)
+                subset_ohlc = ohlc_data.tail(120)
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile:
+                    mpf.plot(subset_ohlc, type='candle', mav=(5, 20), volume=True, style=s, 
+                             title=f"\n{stock} Daily Chart (Last 6 Months)", 
+                             savefig=dict(fname=tmpfile.name, dpi=100, pad_inches=0.25))
+                    tmp_filename = tmpfile.name
+
+                pdf.image(tmp_filename, x=10, y=60, w=190)
+                os.unlink(tmp_filename)
+                pdf.ln(120) 
+
+                # --- AI 數據包 ---
+                ai_data = {
+                    "symbol": stock,
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M'),
+                    "price_data": {"current": round(price_now, 2), "bias_20_pct": round(bias_20, 2)},
+                    "chips_data": {"foreign_net_buy_5d": float(f_buy), "trust_net_buy_5d": float(t_buy)},
+                    "fundamentals": {"monthly_revenue_yoy_pct": round(yoy, 2) if yoy is not None else None},
+                    "indicators": {"k_value": round(k, 2), "d_value": round(d, 2)}
+                }
+                all_ai_data_list.append(ai_data)
+            
+            st.session_state['analyzed_data'] = processed_data
+            st.session_state['json_txt'] = json.dumps(all_ai_data_list, indent=4, ensure_ascii=False)
+            try:
+                st.session_state['pdf_bytes'] = pdf.output(dest='S').encode('latin-1')
+            except:
+                st.session_state['pdf_bytes'] = None
+
+    st.info("提示：輸入代號即可，系統會自動加上 .TW")
+
+# --- 顯示邏輯 ---
+if st.session_state['analyzed_data']:
+    
+    col_d1, col_d2 = st.columns(2)
+    if st.session_state['json_txt']:
+        with col_d1:
+            st.download_button(
+                label="📥 下載 AI 數據包 (.txt)",
+                data=st.session_state['json_txt'],
+                file_name=f"gemini_stock_data_{datetime.now().strftime('%Y%m%d')}.txt",
+                mime="text/plain"
+            )
+
+    if st.session_state['pdf_bytes']:
+        with col_d2:
+            st.download_button(
+                label="📥 下載視覺化報告 (.pdf)",
+                data=st.session_state['pdf_bytes'],
+                file_name=f"gemini_stock_report_{datetime.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf"
+            )
+    
+    st.divider()
+
+    for item in st.session_state['analyzed_data']:
+        st.subheader(f"🔷 {item['stock']}")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1: st.metric("最新股價", f"{item['price_now']:.2f}", f"{item['bias_20']:.2f}% (乖離)")
+        with col2: st.metric("KD 指標", f"K{item['k']:.1f} / D{item['d']:.1f}")
+        with col3: st.metric("法人籌碼 (5日)", f"外{int(item['f_buy'])} / 投{int(item['t_buy'])}")
+        with col4: st.metric("月營收 YoY", item['yoy_str'])
+        
+        # 這裡會讀取乾淨的數據，圖表應該會正常顯示了
+        st.line_chart(item['data_close'].tail(100))
+        st.markdown("---")
