@@ -283,4 +283,10 @@ if st.session_state['analyzed_data']:
     for item in st.session_state['analyzed_data']:
         st.subheader(f"🔷 {item['stock']}")
         col1, col2, col3, col4 = st.columns(4)
-        with col1: st.metric("最新股價", f"{item['
+        with col1: st.metric("最新股價", f"{item['price_now']:.2f}", f"{item['bias_20']:.2f}% (乖離)")
+        with col2: st.metric("KD 指標", f"K{item['k']:.1f} / D{item['d']:.1f}")
+        with col3: st.metric("法人籌碼 (5日)", f"外{int(item['f_buy'])} / 投{int(item['t_buy'])}")
+        with col4: st.metric("月營收 YoY", item['yoy_str'])
+        
+        st.line_chart(item['data_close'].tail(100))
+        st.markdown("---")
