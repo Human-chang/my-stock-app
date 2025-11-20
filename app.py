@@ -26,6 +26,8 @@ if 'json_txt' not in st.session_state:
 @st.cache_data(ttl=3600)
 def get_stock_data(tickers):
     try:
+        # 下載包含 Open, High, Low, Close, Volume 的完整數據
+        # group_by='ticker' 可以確保格式統一，雖非必須但較保險
         df = yf.download(tickers, period="1y", progress=False, auto_adjust=True)
         return df
     except Exception as e:
@@ -140,32 +142,38 @@ with st.sidebar:
                 clean_stock = stock.replace('.TW', '')
                 
                 try:
-                    if len(stock_list_tw) > 1:
-                        data_close = df_all['Close'][stock]
-                        data_high = df_all['High'][stock]
-                        data_low = df_all['Low'][stock]
-                        data_open = df_all['Open'][stock]
-                        data_volume = df_all['Volume'][stock]
+                    # --- 關鍵修正：統一資料讀取格式 (防呆機制) ---
+                    # 判斷是否為 MultiIndex (多層索引，通常多檔股票時會出現)
+                    if isinstance(df_all.columns, pd.MultiIndex):
+                        # 嘗試提取該股票的數據
+                        try:
+                            stock_df = df_all.xs(stock, axis=1, level=1)
+                        except KeyError:
+                            # 如果抓不到，可能是下市或代號錯誤
+                            continue
                     else:
-                        data_close = df_all['Close']
-                        data_high = df_all['High']
-                        data_low = df_all['Low']
-                        data_open = df_all['Open']
-                        data_volume = df_all['Volume']
-
-                    ohlc_data = pd.DataFrame({
-                        'Open': data_open, 'High': data_high, 'Low': data_low,
-                        'Close': data_close, 'Volume': data_volume
-                    })
-                    # 關鍵修正：這裡清洗了數據 (移除空值)
-                    ohlc_data.dropna(inplace=True)
+                        # 單層索引 (通常單檔股票時會出現)
+                        stock_df = df_all
                     
+                    # 確保我們拿到的是 DataFrame
+                    ohlc_data = pd.DataFrame({
+                        'Open': stock_df['Open'],
+                        'High': stock_df['High'],
+                        'Low': stock_df['Low'],
+                        'Close': stock_df['Close'],
+                        'Volume': stock_df['Volume']
+                    })
+                    
+                    # 清洗數據
+                    ohlc_data.dropna(inplace=True)
                     if ohlc_data.empty: continue
 
-                except KeyError: continue
+                except Exception as e:
+                    # 遇到奇怪的資料格式就跳過，避免整個程式崩潰
+                    continue
 
                 # 計算指標 (使用清洗後的數據)
-                clean_close = ohlc_data['Close'] # 確保使用乾淨的 Series
+                clean_close = ohlc_data['Close'] 
                 
                 price_now = float(clean_close.iloc[-1])
                 ma5 = float(clean_close.rolling(5).mean().iloc[-1])
@@ -174,12 +182,12 @@ with st.sidebar:
                 k, d, k_prev, d_prev = calculate_kd(clean_close, ohlc_data['High'], ohlc_data['Low'])
                 f_buy, t_buy, yoy, yoy_str, rev_amt = get_finmind_data(stock)
 
-                # 儲存到 Session (關鍵：這裡改存 clean_close，確保 Web 圖表有數據)
+                # 儲存到 Session
                 processed_data.append({
                     "stock": stock,
                     "price_now": price_now, "bias_20": bias_20,
                     "k": k, "d": d, "f_buy": f_buy, "t_buy": t_buy, "yoy_str": yoy_str,
-                    "data_close": clean_close  # <--- 修正點：存入乾淨的數據
+                    "data_close": clean_close 
                 })
 
                 # --- PDF 生成 ---
@@ -258,6 +266,5 @@ if st.session_state['analyzed_data']:
         with col3: st.metric("法人籌碼 (5日)", f"外{int(item['f_buy'])} / 投{int(item['t_buy'])}")
         with col4: st.metric("月營收 YoY", item['yoy_str'])
         
-        # 這裡會讀取乾淨的數據，圖表應該會正常顯示了
         st.line_chart(item['data_close'].tail(100))
         st.markdown("---")
